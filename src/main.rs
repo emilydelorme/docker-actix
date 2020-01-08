@@ -1,50 +1,117 @@
-use actix_web::{middleware, web, App, HttpRequest, HttpServer};
+#[macro_use]
+extern crate actix_web;
 
-async fn index(req: HttpRequest) -> &'static str {
-    println!("REQ: {:?}", req);
-    "Hello world!"
+use std::{env, io};
+
+use actix_files as fs;
+use actix_session::{CookieSession, Session};
+use actix_utils::mpsc;
+use actix_web::http::{header, Method, StatusCode};
+use actix_web::{
+    error, guard, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer,
+    Result,
+};
+use bytes::Bytes;
+
+/// favicon handler
+#[get("/favicon")]
+async fn favicon() -> Result<fs::NamedFile> {
+    Ok(fs::NamedFile::open("static/favicon.ico")?)
+}
+
+/// simple index handler
+#[get("/welcome")]
+async fn welcome(session: Session, req: HttpRequest) -> Result<HttpResponse> {
+    println!("{:?}", req);
+
+    // session
+    let mut counter = 1;
+    if let Some(count) = session.get::<i32>("counter")? {
+        println!("SESSION value: {}", count);
+        counter = count + 1;
+    }
+
+    // set counter to session
+    session.set("counter", counter)?;
+
+    // response
+    Ok(HttpResponse::build(StatusCode::OK)
+        .content_type("text/html; charset=utf-8")
+        .body(include_str!("../static/welcome.html")))
+}
+
+/// simple index handler
+#[get("/")]
+async fn index(session: Session, req: HttpRequest) -> Result<HttpResponse> {
+    println!("{:?}", req);
+
+    // response
+    Ok(HttpResponse::build(StatusCode::OK)
+        .content_type("text/html; charset=utf-8")
+        .body(include_str!("../static/index.html")))
+}
+
+/// 404 handler
+async fn p404() -> Result<fs::NamedFile> {
+    Ok(fs::NamedFile::open("static/404.html")?.set_status_code(StatusCode::NOT_FOUND))
+}
+
+/// response body
+async fn response_body(path: web::Path<String>) -> HttpResponse {
+    let text = format!("Hello {}!", *path);
+
+    let (tx, rx_body) = mpsc::channel();
+    let _ = tx.send(Ok::<_, Error>(Bytes::from(text)));
+
+    HttpResponse::Ok().streaming(rx_body)
+}
+
+/// handler with path parameters like `/user/{name}/`
+async fn with_param(req: HttpRequest, path: web::Path<(String,)>) -> HttpResponse {
+    println!("{:?}", req);
+
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(format!("Hello {}!", path.0))
 }
 
 #[actix_rt::main]
-async fn main() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "actix_web=info");
+async fn main() -> io::Result<()> {
+    env::set_var("RUST_LOG", "actix_web=debug,actix_server=info");
     env_logger::init();
 
     HttpServer::new(|| {
         App::new()
-            // enable logger
+            // cookie session middleware
+            .wrap(CookieSession::signed(&[0; 32]).secure(false))
+            // enable logger - always register actix-web Logger middleware last
             .wrap(middleware::Logger::default())
-            .service(web::resource("/index.html").to(|| async { "Hello world!" }))
-            .service(web::resource("/").to(index))
+            // register favicon
+            .service(favicon)
+            // register simple route, handle all methods
+            .service(index)
+            .service(web::resource("/error").to(|| {
+                async {
+                    error::InternalError::new(
+                        io::Error::new(io::ErrorKind::Other, "test"),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                }
+            }))
+            // default
+            .default_service(
+                // 404 for GET request
+                web::resource("")
+                    .route(web::get().to(p404))
+                    // all requests that are not `GET`
+                    .route(
+                        web::route()
+                            .guard(guard::Not(guard::Get()))
+                            .to(HttpResponse::MethodNotAllowed),
+                    ),
+            )
     })
-    .bind("127.0.0.1:80")?
+    .bind("127.0.0.1:8080")?
     .run()
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use actix_web::dev::Service;
-    use actix_web::{http, test, web, App, Error};
-
-    #[actix_rt::test]
-    async fn test_index() -> Result<(), Error> {
-        let app = App::new().route("/", web::get().to(index));
-        let mut app = test::init_service(app).await;
-
-        let req = test::TestRequest::get().uri("/").to_request();
-        let resp = app.call(req).await.unwrap();
-
-        assert_eq!(resp.status(), http::StatusCode::OK);
-
-        let response_body = match resp.response().body().as_ref() {
-            Some(actix_web::body::Body::Bytes(bytes)) => bytes,
-            _ => panic!("Response error"),
-        };
-
-        assert_eq!(response_body, r##"Hello world!"##);
-
-        Ok(())
-    }
 }
